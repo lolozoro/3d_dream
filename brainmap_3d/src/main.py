@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,18 +8,28 @@ from fastapi.responses import FileResponse
 import os
 
 from src.core.config import settings
+from src.core.logging_utils import setup_logging, get_logger, StepTimer
 from src.db.base import Base
 from src.db.session import engine
 from src.api import api_router, frontend_router_tagged
+
+setup_logging(level=logging.DEBUG if settings.DEBUG else logging.INFO)
+logger = get_logger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    logger.info("🚀 应用启动中...")
+    with StepTimer(logger, " lifespan: 数据库初始化"):
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+    logger.info("✅ 应用启动完成，数据库表已初始化")
     yield
-    await engine.dispose()
+    logger.info("🛑 应用关闭中...")
+    with StepTimer(logger, "lifespan: 引擎释放"):
+        await engine.dispose()
+    logger.info("✅ 应用关闭完成")
 
 
 app = FastAPI(
@@ -59,14 +70,16 @@ if os.path.isdir(FRONTEND_DIR):
 
 @app.get("/", include_in_schema=False)
 async def serve_index():
-    index_path = os.path.join(FRONTEND_DIR, "index.html")
-    if os.path.exists(index_path):
-        return FileResponse(index_path)
-    return {"name": settings.APP_NAME, "version": settings.APP_VERSION, "docs": "/docs"}
+    with StepTimer(logger, "API serve_index"):
+        index_path = os.path.join(FRONTEND_DIR, "index.html")
+        if os.path.exists(index_path):
+            return FileResponse(index_path)
+        return {"name": settings.APP_NAME, "version": settings.APP_VERSION, "docs": "/docs"}
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "version": settings.APP_VERSION}
+    with StepTimer(logger, "API health_check"):
+        return {"status": "ok", "version": settings.APP_VERSION}
 
 
 if __name__ == "__main__":

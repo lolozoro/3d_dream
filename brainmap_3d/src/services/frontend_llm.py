@@ -12,10 +12,13 @@ import httpx
 from openai import AsyncOpenAI
 
 from src.core.config import settings
+from src.core.logging_utils import get_logger, StepTimer
 from src.schemas.frontend import (
     ChatRequest, MindMapUpdateRequest,
     MindMap, MindMapNode, MindMapEdge,
 )
+
+logger = get_logger(__name__)
 
 
 class FrontendLLMService:
@@ -39,31 +42,33 @@ class FrontendLLMService:
         Build a system prompt from the current mindmap, append user messages,
         call LLM, and return (reply_text, optional_new_mindmap).
         """
-        system_prompt = self._build_mindmap_system_prompt(req.mindmap)
-        messages = [{"role": "system", "content": system_prompt}]
-        for m in req.messages:
-            messages.append({"role": m.role, "content": m.content})
+        with StepTimer(logger, f"FrontendLLMService.chat | messages={len(req.messages)} nodes={len(req.mindmap.nodes)}"):
+            system_prompt = self._build_mindmap_system_prompt(req.mindmap)
+            messages = [{"role": "system", "content": system_prompt}]
+            for m in req.messages:
+                messages.append({"role": m.role, "content": m.content})
 
-        if not self.has_key:
-            # ---- Fallback: deterministic mock responses ----
-            reply = self._mock_chat_reply(req)
-            return reply, None
+            if not self.has_key:
+                # ---- Fallback: deterministic mock responses ----
+                reply = self._mock_chat_reply(req)
+                return reply, None
 
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            stream=False,
-        )
-        content = response.choices[0].message.content or ""
+            with StepTimer(logger, "FrontendLLMService.chat -> LLM call"):
+                response = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    stream=False,
+                )
+            content = response.choices[0].message.content or ""
 
-        # Try to detect if the assistant also wants to mutate the map.
-        # We look for a markdown JSON block tagged with ```json ... ```
-        updated_map = self._try_extract_mindmap(content)
-        # Strip the JSON block from the visible reply so the user doesn't see raw JSON
-        reply_text = self._strip_json_block(content) if updated_map else content
-        return reply_text, updated_map
+            # Try to detect if the assistant also wants to mutate the map.
+            # We look for a markdown JSON block tagged with ```json ... ```
+            updated_map = self._try_extract_mindmap(content)
+            # Strip the JSON block from the visible reply so the user doesn't see raw JSON
+            reply_text = self._strip_json_block(content) if updated_map else content
+            return reply_text, updated_map
 
     # ------------------------------------------------------------------
     # 2. /mindmap/update
@@ -73,37 +78,39 @@ class FrontendLLMService:
         Ask the LLM to produce a **complete** new mindmap according to the instruction.
         Returns (new_mindmap, explanation).
         """
-        system_prompt = self._build_update_system_prompt(req.mindmap, req.instruction)
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Instruction: {req.instruction}"},
-        ]
+        with StepTimer(logger, f"FrontendLLMService.update_mindmap | nodes={len(req.mindmap.nodes)} instruction={req.instruction[:30]}"):
+            system_prompt = self._build_update_system_prompt(req.mindmap, req.instruction)
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Instruction: {req.instruction}"},
+            ]
 
-        if not self.has_key:
-            # ---- Fallback: simple deterministic mutation ----
-            new_map, explanation = self._mock_update_mindmap(req)
+            if not self.has_key:
+                # ---- Fallback: simple deterministic mutation ----
+                new_map, explanation = self._mock_update_mindmap(req)
+                return new_map, explanation
+
+            with StepTimer(logger, "FrontendLLMService.update_mindmap -> LLM call"):
+                response = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    stream=False,
+                )
+            content = response.choices[0].message.content or ""
+
+            # Extract JSON mindmap from the response
+            parsed = self._try_extract_mindmap(content)
+            if parsed is None:
+                # If LLM didn't return valid JSON, fallback to echoing original + explanation
+                explanation = "AI 未能生成有效结构，已保持原图。"
+                return req.mindmap, explanation
+
+            # Validate & sanitise
+            new_map = self._sanitise_mindmap(parsed)
+            explanation = self._try_extract_explanation(content) or "脑图已更新。"
             return new_map, explanation
-
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            stream=False,
-        )
-        content = response.choices[0].message.content or ""
-
-        # Extract JSON mindmap from the response
-        parsed = self._try_extract_mindmap(content)
-        if parsed is None:
-            # If LLM didn't return valid JSON, fallback to echoing original + explanation
-            explanation = "AI 未能生成有效结构，已保持原图。"
-            return req.mindmap, explanation
-
-        # Validate & sanitise
-        new_map = self._sanitise_mindmap(parsed)
-        explanation = self._try_extract_explanation(content) or "脑图已更新。"
-        return new_map, explanation
 
     # ------------------------------------------------------------------
     # Prompt builders

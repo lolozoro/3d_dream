@@ -1,5 +1,6 @@
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from src.core.config import settings
+from src.core.logging_utils import get_logger, StepTimer
 
 engine = create_async_engine(
     settings.DATABASE_URL,
@@ -15,10 +16,13 @@ AsyncSessionLocal = async_sessionmaker(
     autocommit=False,
 )
 
+logger = get_logger(__name__)
+
 
 async def get_db() -> AsyncSession:
-    async with AsyncSessionLocal() as session:
-        try:
-            yield session
-        finally:
-            await session.close()
+    with StepTimer(logger, "DB session acquire"):
+        async with AsyncSessionLocal() as session:
+            try:
+                yield session
+            finally:
+                await session.close()
